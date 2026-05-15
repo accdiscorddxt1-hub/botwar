@@ -475,7 +475,7 @@ async def on_ready():
 @bot.command()
 async def menu(ctx):
     if ctx.author.id != ADMIN_ID: return
-    embed = discord.Embed(title="MENU BOT (MQTT + Proxy Failover)", color=0xB8F0FF)
+    embed = discord.Embed(title="MENU BOT T25", color=0xB8F0FF)
     embed.add_field(name="Lệnh", value=f"""
 `{PREFIX}menu` - Menu
 `{PREFIX}setfile` - Upload file .txt (dùng chung)
