@@ -1,730 +1,706 @@
 import discord
 from discord.ext import commands
-import asyncio
-import os
-import re
+import threading
 import time
 import json
+import uuid
+import ssl
+import paho.mqtt.client as mqtt
+import warnings
 import requests
+import re
 import random
-import base64
 import gc
+import asyncio
+import os
+import hashlib
+import string
+import psutil
 from datetime import datetime
-from typing import Dict, Any
+from urllib.parse import urlparse
+from typing import Optional, List
 
-# Kiểm tra và import psutil an toàn
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    print("[CẢNH BÁO] psutil không có sẵn, chức năng dọn RAM sẽ bị hạn chế")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Nhập dữ liệu khi khởi chạy
-TOKEN = input("Nhập Token Bot: ")
-IDADMIN_GOC = int(input("Nhập ID Admin gốc: "))
-PREFIX = input("Nhập Prefix Bot: ")
+# ============= PROXY FAILOVER =============
+PROXY_FILE = input("Nhập đường dẫn file proxy list (bỏ trống nếu không): ").strip()
+proxy_list = []
+if PROXY_FILE and os.path.isfile(PROXY_FILE):
+    with open(PROXY_FILE, 'r', encoding='utf-8') as f:
+        proxy_list = [line.strip() for line in f if line.strip()]
+    print(f"[!] Đã tải {len(proxy_list)} proxy")
+else:
+    print("[!] Không dùng proxy")
 
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+proxy_index = 0
+proxy_lock = threading.Lock()
 
-# RAM lưu trạng thái
-admins = [IDADMIN_GOC]
-saved_files = {}
-running_tasks = {}
-task_info = {}
-cookie_managers = {}
+def get_next_proxy():
+    if not proxy_list:
+        return None
+    with proxy_lock:
+        p = proxy_list[proxy_index % len(proxy_list)]
+        proxy_index += 1
+        return p
 
-# Màu cho console
-COLOR_ERROR = "\033[91m"
-COLOR_SUCCESS = "\033[92m"
-COLOR_WARNING = "\033[93m"
-COLOR_RESET = "\033[0m"
-trang = COLOR_RESET
+# ============= BOT CONFIG =============
+BOT_TOKEN = input("Token bot: ").strip()
+ADMIN_ID = int(input("ID Admin: ").strip())
+PREFIX = input("Prefix: ").strip()
 
-# Cấu hình dọn RAM - 1 phút 1 lần
-RAM_CLEAN_INTERVAL = 60
-last_ram_clean = time.time()
+# Lưu nội dung file mặc định
+default_full_text = ""       # toàn bộ nội dung file (dùng cho ngonmess)
+default_lines = []           # list các dòng (dùng cho treopoll, nhaytag)
+default_poll_question = ""   # câu hỏi poll (dòng 1)
+default_poll_options = []    # 2 lựa chọn (dòng 2, 3)
 
-def get_ram_usage_mb():
-    """Lấy RAM đang dùng (MB)"""
-    if PSUTIL_AVAILABLE:
+active_tabs = {}
+BOT_START_TIME = time.time()
+
+# ============= AUTO RAM CLEANER =============
+def auto_clean_ram():
+    while True:
+        time.sleep(1800)
         try:
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / 1024 / 1024
-        except:
-            return 0
-    return 0
-
-def clean_ram():
-    """Dọn RAM"""
-    gc.collect()
-    gc.collect()
-    
-    # Xóa task rác
-    for task_id in list(running_tasks.keys()):
-        try:
-            if running_tasks[task_id].done():
-                del running_tasks[task_id]
+            mem = psutil.virtual_memory()
+            if mem.percent > 70:
+                gc.collect()
+                print(f"[RAM] Đã dọn, sử dụng: {mem.percent}%")
         except:
             pass
-    
-    for task_id in list(task_info.keys()):
-        if task_id not in running_tasks:
-            try:
-                del task_info[task_id]
-            except:
-                pass
-    
-    if PSUTIL_AVAILABLE:
-        ram_used = get_ram_usage_mb()
-        print(f"{COLOR_SUCCESS}[RAM] Đã dọn, RAM hiện: {ram_used:.2f} MB{trang}")
-    else:
-        print(f"{COLOR_SUCCESS}[RAM] Đã dọn{trang}")
+threading.Thread(target=auto_clean_ram, daemon=True).start()
 
-async def ram_cleaner_loop():
-    """Chạy ngầm dọn RAM mỗi 1 phút"""
-    await bot.wait_until_ready()
-    global last_ram_clean
-    while not bot.is_closed():
-        try:
-            current_time = time.time()
-            if current_time - last_ram_clean >= RAM_CLEAN_INTERVAL:
-                clean_ram()
-                last_ram_clean = current_time
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"{COLOR_ERROR}[LỖI] Ram cleaner: {e}{trang}")
-            await asyncio.sleep(10)
+# ============= UTILITY =============
+def generate_offline_threading_id():
+    return str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
 
-# Hàm lấy uid từ cookie
-def get_uid(cookie):
-    try:
-        match = re.search(r'c_user=(\d+)', cookie)
-        return match.group(1) if match else '0'
-    except:
-        return '0'
+def json_minimal(data):
+    return json.dumps(data, separators=(",", ":"))
 
-# Class CookieManager quản lý refresh fb_dtsg
-class CookieManager:
-    def __init__(self, cookie, target_id):
+def parse_cookie_string(cookie_string):
+    cookies = {}
+    for part in cookie_string.split(";"):
+        if "=" in part:
+            key, value = part.strip().split("=", 1)
+            cookies[key] = value
+    return cookies
+
+def generate_session_id():
+    return hashlib.md5(str(time.time()).encode()).hexdigest()
+
+def generate_client_id():
+    return str(random.randint(10**14, 10**15 - 1))
+
+def get_uid_from_cookie(cookie):
+    match = re.search(r'c_user=(\d+)', cookie)
+    return match.group(1) if match else None
+
+# ============= HTTP (cho lệnh idbox) =============
+class FacebookSession:
+    def __init__(self, cookie, proxy_dict=None):
         self.cookie = cookie
-        self.target_id = target_id
-        self.user_id = None
+        self.uid = self.get_uid()
+        self.proxy_dict = proxy_dict
+        self.fb_dtsg, self.jazoest = self.init_params()
+
+    def get_uid(self):
+        try:
+            return re.search(r"c_user=(\d+)", self.cookie).group(1)
+        except:
+            raise Exception("Cookie không hợp lệ (thiếu c_user)")
+
+    def init_params(self):
+        headers = {'Cookie': self.cookie, 'User-Agent': 'Mozilla/5.0'}
+        try:
+            response = requests.get('https://www.facebook.com', headers=headers, proxies=self.proxy_dict, timeout=15)
+            fb_dtsg_match = re.search(r'"token":"(.*?)"', response.text)
+            jazoest_match = re.search(r'name="jazoest" value="(\d+)"', response.text)
+            if not fb_dtsg_match:
+                response = requests.get('https://mbasic.facebook.com', headers=headers, proxies=self.proxy_dict, timeout=15)
+                fb_dtsg_match = re.search(r'name="fb_dtsg" value="(.*?)"', response.text)
+                jazoest_match = re.search(r'name="jazoest" value="(\d+)"', response.text)
+            if fb_dtsg_match:
+                fb_dtsg = fb_dtsg_match.group(1)
+                jazoest = jazoest_match.group(1) if jazoest_match else "22036"
+                return fb_dtsg, jazoest
+            raise Exception("Không thể lấy fb_dtsg")
+        except Exception as e:
+            raise Exception(f"Lỗi lấy fb_dtsg: {str(e)}")
+
+def get_thread_list(cookie, proxy_dict=None, limit=500):
+    try:
+        session = FacebookSession(cookie, proxy_dict)
+    except Exception as e:
+        return {"error": str(e)}
+    form_data = {
+        "av": session.uid, "__user": session.uid, "fb_dtsg": session.fb_dtsg, "jazoest": session.jazoest,
+        "__a": "1", "__req": "1b", "__rev": "1015919737", "__comet_req": "15",
+        "__spin_r": "999999999", "__spin_b": "trunk", "__spin_t": str(int(time.time())),
+        "queries": json.dumps({
+            "o0": {
+                "doc_id": "3336396659757871",
+                "query_params": {
+                    "limit": limit, "before": None, "tags": ["INBOX"],
+                    "includeDeliveryReceipts": False, "includeSeqID": True
+                }
+            }
+        })
+    }
+    headers = {"Cookie": cookie, "User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        response = requests.post("https://www.facebook.com/api/graphqlbatch/", data=form_data, headers=headers, proxies=proxy_dict, timeout=15)
+        data_raw = response.text.split('{"successful_results"')[0]
+        data = json.loads(data_raw)
+        threads = data["o0"]["data"]["viewer"]["message_threads"]["nodes"]
+        result = []
+        for thread in threads:
+            if thread.get("thread_key", {}).get("thread_fbid"):
+                result.append({"thread_id": thread["thread_key"]["thread_fbid"], "thread_name": thread.get("name") or "Không có tên"})
+        return result
+    except Exception as e:
+        return {"error": f"Lỗi lấy danh sách box: {e}"}
+
+# ============= MQTT CLIENT WRAPPER (FAILOVER) =============
+class MQTTClientWrapper:
+    def __init__(self, cookie):
+        self.cookie = cookie
+        self.uid = None
         self.fb_dtsg = None
         self.jazoest = None
-        self.last_refresh = 0
-        self.refresh_interval = 300
-        
-    def init_params(self):
-        try:
-            response = requests.get(
-                f'https://mbasic.facebook.com/privacy/touch/block/confirm/?bid={self.target_id}&ret_cancel&source=profile',
-                headers={'cookie': self.cookie, 'user-agent': 'Mozilla/5.0'},
-                timeout=30
-            )
-            fb_dtsg_match = re.search(r'name="fb_dtsg" value="([^"]+)"', response.text)
-            jazoest_match = re.search(r'name="jazoest" value="([^"]+)"', response.text)
-            
-            if fb_dtsg_match and jazoest_match:
-                self.fb_dtsg = fb_dtsg_match.group(1)
-                self.jazoest = jazoest_match.group(1)
-                self.user_id = get_uid(self.cookie)
-                self.last_refresh = time.time()
-                print(f"{COLOR_SUCCESS}[COOKIE] Đã refresh fb_dtsg cho user {self.user_id}{trang}")
-                return True
-            return False
-        except Exception as e:
-            print(f"{COLOR_ERROR}[LỖI] Init params: {str(e)}{trang}")
-            return False
-    
-    def refresh_fb_dtsg(self):
-        self.fb_dtsg = None
-        try:
-            self.init_params()
-            return self.fb_dtsg is not None
-        except Exception as e:
-            print(f"{COLOR_ERROR}[LỖI LÀM MỚI] Cookie {self.user_id}: {str(e)}{trang}")
-            return False
-    
-    def is_valid(self):
-        if not self.fb_dtsg or not self.jazoest:
-            return False
-        if time.time() - self.last_refresh > self.refresh_interval:
-            return self.refresh_fb_dtsg()
-        return True
-    
-    def get_fb_dtsg(self):
-        if not self.is_valid():
-            self.refresh_fb_dtsg()
-        return self.fb_dtsg
-    
-    def get_jazoest(self):
-        if not self.is_valid():
-            self.refresh_fb_dtsg()
-        return self.jazoest
+        self.mqtt = None
+        self.connected = False
+        self.ws_req_number = 0
+        self.ws_task_number = 0
 
-def send_message_with_manager(cm: CookieManager, message_body):
-    try:
-        fb_dtsg = cm.get_fb_dtsg()
-        jazoest = cm.get_jazoest()
-        if not fb_dtsg or not jazoest:
-            return False
-            
-        uid = cm.user_id
-        timestamp = int(time.time() * 1000)
-        data = {
-            'thread_fbid': cm.target_id,
-            'action_type': 'ma-type:user-generated-message',
-            'body': message_body,
-            'client': 'mercury',
-            'author': f'fbid:{uid}',
-            'timestamp': timestamp,
-            'source': 'source:chat:web',
-            'offline_threading_id': str(timestamp),
-            'message_id': str(timestamp),
-            'ephemeral_ttl_mode': '',
-            '__user': uid,
-            '__a': '1',
-            '__req': '1b',
-            '__rev': '1015919737',
-            'fb_dtsg': fb_dtsg,
-            'jazoest': jazoest
-        }
-        headers = {
-            'Cookie': cm.cookie,
-            'User-Agent': 'Mozilla/5.0',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://www.facebook.com',
-            'Referer': f'https://www.facebook.com/messages/t/{cm.target_id}'
-        }
-        response = requests.post('https://www.facebook.com/messaging/send/', data=data, headers=headers, timeout=30)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"{COLOR_ERROR}[LỖI GỬI] {str(e)}{trang}")
+    def _refresh_tokens_with_proxy(self, proxy_dict):
+        sess = FacebookSession(self.cookie, proxy_dict)
+        self.uid = sess.uid
+        self.fb_dtsg = sess.fb_dtsg
+        self.jazoest = sess.jazoest
+        return True
+
+    def connect(self):
+        max_retries = len(proxy_list) if proxy_list else 1
+        for attempt in range(max_retries):
+            proxy = get_next_proxy() if proxy_list else None
+            proxy_dict = {"http": proxy, "https": proxy} if proxy else None
+            try:
+                if not self.fb_dtsg or attempt > 0:
+                    self._refresh_tokens_with_proxy(proxy_dict)
+
+                session_id = generate_session_id()
+                client_id = generate_client_id()
+                user_info = {
+                    "u": self.uid, "s": session_id, "chat_on": True, "fg": False, "d": client_id,
+                    "ct": "websocket", "aid": "219994525426954", "mqtt_sid": "", "cp": 3, "ecp": 10,
+                    "st": [], "pm": [], "dc": "", "no_auto_fg": True, "gas": None, "pack": []
+                }
+                cookie_str = "; ".join([f"{k}={v}" for k, v in parse_cookie_string(self.cookie).items()])
+                self.mqtt = mqtt.Client(client_id="mqttwsclient", clean_session=True, protocol=mqtt.MQTTv31, transport="websockets")
+                self.mqtt.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLSv1_2)
+                self.mqtt.tls_insecure_set(True)
+                self.mqtt.username_pw_set(username=json_minimal(user_info))
+                self.mqtt.ws_set_options(path="/chat", headers={
+                    "Cookie": cookie_str, "Origin": "https://www.facebook.com",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Referer": "https://www.facebook.com/", "Host": "edge-chat.facebook.com"
+                })
+                connected_event = threading.Event()
+                def on_connect(client, userdata, flags, rc):
+                    self.connected = (rc == 0)
+                    connected_event.set()
+                self.mqtt.on_connect = on_connect
+                self.mqtt.connect("edge-chat.facebook.com", 443, 10)
+                self.mqtt.loop_start()
+                if connected_event.wait(timeout=10) and self.connected:
+                    print(f"[MQTT] Kết nối thành công (proxy: {proxy})")
+                    return True
+                else:
+                    raise Exception("Kết nối timeout")
+            except Exception as e:
+                print(f"[MQTT] Lỗi với proxy {proxy}: {e}")
+                if self.mqtt:
+                    self.mqtt.loop_stop()
+                    self.mqtt.disconnect()
+                self.connected = False
+                self.fb_dtsg = None
+                continue
         return False
 
-# Lệnh addadmin
-@bot.command()
-async def addadmin(ctx, member: discord.Member):
-    if ctx.author.id != IDADMIN_GOC:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    if member.id not in admins:
-        admins.append(member.id)
-        await ctx.send(f"Đã thêm `{member.name}` vào danh sách admin.")
-    else:
-        await ctx.send("Người này đã là admin rồi.")
+    def disconnect(self):
+        if self.mqtt and self.connected:
+            self.mqtt.loop_stop()
+            self.mqtt.disconnect()
+            self.connected = False
 
-@bot.command()
-async def deladmin(ctx, member: discord.Member):
-    if ctx.author.id != IDADMIN_GOC:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    if member.id in admins and member.id != IDADMIN_GOC:
-        admins.remove(member.id)
-        await ctx.send(f"Đã xoá `{member.name}` khỏi danh sách admin.")
-        
-        to_remove = [task_id for task_id, info in task_info.items() if info.get('admin_id') == member.id]
-        for task_id in to_remove:
-            if task_id in running_tasks:
-                try:
-                    running_tasks[task_id].cancel()
-                except:
-                    pass
-                del running_tasks[task_id]
-            if task_id in cookie_managers:
-                del cookie_managers[task_id]
-            if task_id in task_info:
-                del task_info[task_id]
-        await ctx.send(f"Đã dừng tất cả task do `{member.name}` tạo.")
-    else:
-        await ctx.send("Không thể xoá admin gốc hoặc người này không phải admin.")
-
-@bot.command()
-async def listadmin(ctx):
-    msg = "**Danh sách admin hiện tại:**\n"
-    for admin_id in admins:
+    def _publish(self, payload, topic="/ls_req", qos=1):
+        if not self.connected and not self.connect():
+            return False
         try:
-            user = await bot.fetch_user(admin_id)
-            if admin_id == IDADMIN_GOC:
-                msg += f"- `{user.name}` (Admin Gốc)\n"
-            else:
-                msg += f"- `{user.name}`\n"
+            self.mqtt.publish(topic, payload, qos)
+            return True
         except:
-            msg += f"- `{admin_id}` (Không tìm được tên)\n"
-    await ctx.send(msg)
+            self.connected = False
+            return False
 
-# Lưu file
-@bot.command()
-async def setngonmess(ctx):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền.")
-    if not ctx.message.attachments:
-        return await ctx.send("Vui lòng đính kèm file.")
-    admin_id = str(ctx.author.id)
-    file = ctx.message.attachments[0]
-    filename = file.filename
-    os.makedirs(f"data/{admin_id}", exist_ok=True)
-    path = f"data/{admin_id}/{filename}"
-    await file.save(path)
-    await ctx.send(f"Đã lưu file `{filename}` vào thư mục của bạn.")
+    def send_message(self, thread_id, message):
+        self.ws_req_number += 1
+        self.ws_task_number += 1
+        task_payload = {
+            "thread_key": thread_id, "message_text": message,
+            "offline_threading_id": generate_offline_threading_id(), "source": "source:chat:web"
+        }
+        task = {"label": "46", "payload": json_minimal(task_payload), "queue_name": "thread_message", "task_id": self.ws_task_number}
+        content = {
+            "app_id": "2220391788200892",
+            "payload": json_minimal({"data_trace_id": None, "epoch_id": int(generate_offline_threading_id()), "tasks": [task], "version_id": "25095469420099952"}),
+            "request_id": self.ws_req_number, "type": 3
+        }
+        return self._publish(json_minimal(content))
 
-# Lệnh listngonmess
+    def send_typing(self, thread_id, is_typing):
+        self.ws_req_number += 1
+        task_payload = {"thread_key": thread_id, "is_group_thread": 1, "is_typing": 1 if is_typing else 0, "attribution": 0}
+        content = {
+            "app_id": "2220391788200892",
+            "payload": json.dumps({"label": "3", "payload": json.dumps(task_payload, separators=(",", ":")), "version": "25393437286970779"}, separators=(",", ":")),
+            "request_id": self.ws_req_number, "type": 4
+        }
+        return self._publish(json.dumps(content, separators=(",", ":")))
+
+    def send_message_with_mention(self, thread_id, message, mentioned_uids):
+        self.ws_req_number += 1
+        self.ws_task_number += 1
+        body = message
+        profile_xmd = []
+        for uid in mentioned_uids:
+            tag = f"@{uid}"
+            offset = len(body)
+            body += f" {tag}"
+            profile_xmd.append({"id": uid, "offset": offset + 1, "length": len(tag), "type": "p"})
+        task_payload = {
+            "thread_key": thread_id, "message_text": body, "offline_threading_id": generate_offline_threading_id(),
+            "source": "source:chat:web", "profile_xmd": profile_xmd
+        }
+        task = {"label": "46", "payload": json_minimal(task_payload), "queue_name": "thread_message", "task_id": self.ws_task_number}
+        content = {
+            "app_id": "2220391788200892",
+            "payload": json_minimal({"data_trace_id": None, "epoch_id": int(generate_offline_threading_id()), "tasks": [task], "version_id": "25095469420099952"}),
+            "request_id": self.ws_req_number, "type": 3
+        }
+        return self._publish(json_minimal(content))
+
+    def send_poll(self, thread_id, question, options):
+        self.ws_req_number += 1
+        task_payload = {"question_text": question, "thread_key": int(thread_id), "options": options, "sync_group": 1}
+        task = {"label": "163", "payload": json.dumps(task_payload, separators=(",", ":")), "queue_name": "poll_creation", "task_id": random.randint(1, 10000)}
+        content = {
+            "app_id": "2220391788200892",
+            "payload": json.dumps({"epoch_id": int(generate_offline_threading_id()), "tasks": [task], "version_id": "7158486590867448"}, separators=(",", ":")),
+            "request_id": random.randint(1, 5000), "type": 3
+        }
+        return self._publish(json.dumps(content, separators=(",", ":")))
+
+    def set_theme(self, thread_id, theme_id):
+        self.ws_req_number += 1
+        self.ws_task_number += 1
+        task_payload = {"thread_key": thread_id, "theme_fbid": theme_id, "source": None, "sync_group": 1, "payload": None}
+        task = {"failure_count": None, "label": "43", "payload": json_minimal(task_payload), "queue_name": "thread_theme", "task_id": self.ws_task_number}
+        content = {
+            "app_id": "2220391788200892",
+            "payload": json_minimal({"data_trace_id": None, "epoch_id": int(generate_offline_threading_id()), "tasks": [task], "version_id": "25095469420099952"}),
+            "request_id": self.ws_req_number, "type": 3
+        }
+        return self._publish(json_minimal(content))
+
+# ============= DANH SÁCH THEMES =============
+THEMES = [
+    {"id": "3650637715209675", "name": "Besties"},
+    {"id": "769656934577391", "name": "Women's History Month"},
+    {"id": "702099018755409", "name": "Dune: Part Two"},
+    {"id": "1480404512543552", "name": "Avatar: The Last Airbender"},
+    {"id": "952656233130616", "name": "J.Lo"},
+    {"id": "741311439775765", "name": "Love"},
+    {"id": "215565958307259", "name": "Bob Marley: One Love"},
+    {"id": "194982117007866", "name": "Football"},
+    {"id": "1743641112805218", "name": "Soccer"},
+    {"id": "730357905262632", "name": "Mean Girls"},
+    {"id": "1270466356981452", "name": "Wonka"},
+    {"id": "704702021720552", "name": "Pizza"},
+    {"id": "1013083536414851", "name": "Wish"},
+    {"id": "359537246600743", "name": "Trolls"},
+    {"id": "173976782455615", "name": "The Marvels"},
+    {"id": "2317258455139234", "name": "One Piece"},
+    {"id": "6685081604943977", "name": "1989"},
+    {"id": "1508524016651271", "name": "Avocado"},
+    {"id": "265997946276694", "name": "Loki Season 2"},
+    {"id": "6584393768293861", "name": "olivia rodrigo"},
+    {"id": "845097890371902", "name": "Baseball"},
+    {"id": "292955489929680", "name": "Lollipop"},
+    {"id": "976389323536938", "name": "Loops"},
+    {"id": "810978360551741", "name": "Parenthood"},
+    {"id": "195296273246380", "name": "Bubble Tea"},
+    {"id": "6026716157422736", "name": "Basketball"},
+    {"id": "693996545771691", "name": "Elephants & Flowers"},
+    {"id": "390127158985345", "name": "Chill"},
+    {"id": "365557122117011", "name": "Support"},
+    {"id": "339021464972092", "name": "Music"},
+    {"id": "1060619084701625", "name": "Lo-Fi"},
+    {"id": "3190514984517598", "name": "Sky"},
+    {"id": "627144732056021", "name": "Celebration"},
+    {"id": "275041734441112", "name": "Care"},
+    {"id": "3082966625307060", "name": "Astrology"},
+    {"id": "539927563794799", "name": "Cottagecore"},
+    {"id": "527564631955494", "name": "Ocean"},
+    {"id": "230032715012014", "name": "Tie-Dye"},
+    {"id": "788274591712841", "name": "Monochrome"},
+    {"id": "3259963564026002", "name": "Default"},
+    {"id": "724096885023603", "name": "Berry"},
+    {"id": "624266884847972", "name": "Candy"},
+    {"id": "273728810607574", "name": "Unicorn"},
+    {"id": "262191918210707", "name": "Tropical"},
+    {"id": "2533652183614000", "name": "Maple"},
+    {"id": "909695489504566", "name": "Sushi"},
+    {"id": "582065306070020", "name": "Rocket"},
+    {"id": "557344741607350", "name": "Citrus"},
+    {"id": "280333826736184", "name": "Lollipop"},
+    {"id": "271607034185782", "name": "Shadow"},
+    {"id": "1257453361255152", "name": "Rose"},
+    {"id": "571193503540759", "name": "Lavender"},
+    {"id": "2873642949430623", "name": "Tulip"},
+    {"id": "3273938616164733", "name": "Classic"},
+    {"id": "403422283881973", "name": "Apple"},
+    {"id": "3022526817824329", "name": "Peach"},
+    {"id": "672058580051520", "name": "Honey"},
+    {"id": "3151463484918004", "name": "Kiwi"},
+    {"id": "736591620215564", "name": "Ocean"},
+    {"id": "193497045377796", "name": "Grape"}
+]
+
+# ============= LOOPS CHO TỪNG LỆNH =============
+def ngonmess_loop(cookie, idbox, delay, stop_event):
+    global default_full_text
+    if not default_full_text:
+        return
+    mqtt = MQTTClientWrapper(cookie)
+    if not mqtt.connect():
+        return
+    while not stop_event.is_set():
+        mqtt.send_message(idbox, default_full_text)
+        time.sleep(delay)
+    mqtt.disconnect()
+
+def treopoll_loop(cookie, idbox, delay, stop_event):
+    global default_poll_question, default_poll_options
+    if not default_poll_question or len(default_poll_options) < 2:
+        return
+    mqtt = MQTTClientWrapper(cookie)
+    if not mqtt.connect():
+        return
+    while not stop_event.is_set():
+        mqtt.send_typing(idbox, True)
+        time.sleep(random.uniform(2, 5))
+        mqtt.send_poll(idbox, default_poll_question, default_poll_options)
+        mqtt.send_typing(idbox, False)
+        time.sleep(delay)
+    mqtt.disconnect()
+
+def nhaytag_loop(cookie, idbox, uids, delay, stop_event):
+    global default_lines
+    if not default_lines:
+        return
+    mqtt = MQTTClientWrapper(cookie)
+    if not mqtt.connect():
+        return
+    idx = 0
+    while not stop_event.is_set():
+        msg = default_lines[idx % len(default_lines)]
+        idx += 1
+        mqtt.send_typing(idbox, True)
+        time.sleep(random.uniform(2, 5))
+        mqtt.send_message_with_mention(idbox, msg, uids)
+        mqtt.send_typing(idbox, False)
+        time.sleep(delay)
+    mqtt.disconnect()
+
+def nhay_loop(cookie, idbox, delay, stop_event):
+    file_path = "nhay.txt"
+    if not os.path.isfile(file_path):
+        return
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+    if not lines:
+        return
+    mqtt = MQTTClientWrapper(cookie)
+    if not mqtt.connect():
+        return
+    idx = 0
+    while not stop_event.is_set():
+        msg = lines[idx % len(lines)]
+        idx += 1
+        mqtt.send_typing(idbox, True)
+        time.sleep(random.uniform(2, 5))
+        mqtt.send_message(idbox, msg)
+        mqtt.send_typing(idbox, False)
+        time.sleep(delay)
+    mqtt.disconnect()
+
+def setnen_loop(cookie, idbox, delay, stop_event):
+    mqtt = MQTTClientWrapper(cookie)
+    if not mqtt.connect():
+        return
+    while not stop_event.is_set():
+        theme = random.choice(THEMES)
+        mqtt.set_theme(idbox, theme["id"])
+        time.sleep(delay)
+    mqtt.disconnect()
+
+# ============= DISCORD BOT =============
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+def runtime(start):
+    sec = int(time.time() - start)
+    d = sec // 86400
+    h = (sec % 86400) // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{d} ngày {h:02} giờ {m:02} phút {s:02} giây"
+
+@bot.event
+async def on_ready():
+    print(f"Bot đã sẵn sàng: {bot.user}")
+
 @bot.command()
-async def listngonmess(ctx):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    
-    admin_id = str(ctx.author.id)
-    folder = f"data/{admin_id}"
-    
-    if not os.path.exists(folder):
-        return await ctx.send("Bạn chưa lưu file nào. Hãy dùng lệnh `setngonmess` để lưu file.")
-    
-    files = os.listdir(folder)
-    if not files:
-        return await ctx.send("Bạn chưa lưu file nào. Hãy dùng lệnh `setngonmess` để lưu file.")
-    
-    embed = discord.Embed(
-        title=f"📁 Danh sách file của {ctx.author.name}",
-        description=f"Tổng số file: **{len(files)}**",
-        color=discord.Color.green()
-    )
-    
-    for fname in files:
-        path = os.path.join(folder, fname)
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                preview = content.replace('\n', ' ')[:100]
-                line_count = len(content.split('\n'))
-                char_count = len(content)
-                embed.add_field(
-                    name=f"📄 {fname}",
-                    value=f"📝 {preview}...\n📊 {line_count} dòng | {char_count} ký tự",
-                    inline=False
-                )
-        except:
-            embed.add_field(
-                name=f"📄 {fname}",
-                value="⚠️ Không đọc được nội dung file",
-                inline=False
-            )
-    
-    embed.set_footer(text=f"Dùng {PREFIX}ngonmess <id> <cookie> <tên_file> <delay> để spam")
+async def menu(ctx):
+    if ctx.author.id != ADMIN_ID: return
+    embed = discord.Embed(title="MENU BOT (MQTT + Proxy Failover)", color=0xB8F0FF)
+    embed.add_field(name="Lệnh", value=f"""
+`{PREFIX}menu` - Menu
+`{PREFIX}setfile` - Upload file .txt (dùng chung)
+`{PREFIX}idbox <cookie>` - Lấy danh sách box
+`{PREFIX}ngonmess <idbox> <cookie> <delay>` - Gửi toàn bộ file (ko typing)
+`{PREFIX}treopoll <idbox> <cookie> <delay>` - Poll 3 dòng đầu (có typing)
+`{PREFIX}nhaytag <idbox> <cookie> <uid1,uid2,...> <delay>` - Tag từng dòng + typing
+`{PREFIX}nhay <idbox> <cookie> <delay>` - Gửi từng dòng từ nhay.txt + typing (ko tag)
+`{PREFIX}setnen <idbox> <cookie> <delay>` - Set theme random
+`{PREFIX}uptime` - Thời gian bot chạy
+`{PREFIX}tab` - Xem danh sách task
+`{PREFIX}stop <số thứ tự|all>` - Dừng task theo số thứ tự hoặc all
+""", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
-async def xemngonmess(ctx, filename: str = None):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền.")
-    
-    admin_id = str(ctx.author.id)
-    folder = f"data/{admin_id}"
-    
-    if not os.path.exists(folder):
-        return await ctx.send("Bạn chưa lưu file nào.")
-    
-    if filename is None:
-        files = os.listdir(folder)
-        if not files:
-            return await ctx.send("Bạn chưa lưu file nào.")
-        msg = f"**Danh sách file của `{ctx.author.name}`:**\n"
-        for fname in files:
-            path = os.path.join(folder, fname)
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    preview = f.read(100).replace('\n', ' ')
-                    msg += f"`{fname}`: {preview}...\n"
-            except:
-                msg += f"`{fname}`: (Không đọc được nội dung)\n"
-        await ctx.send(msg)
-    else:
-        file_path = f"{folder}/{filename}"
-        if not os.path.exists(file_path):
-            return await ctx.send(f"File `{filename}` không tồn tại.")
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if len(content) > 1900:
-                chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
-                await ctx.send(f"**Nội dung file `{filename}`:**\n```{chunks[0]}```")
-                for chunk in chunks[1:]:
-                    await ctx.send(f"```{chunk}```")
-            else:
-                await ctx.send(f"**Nội dung file `{filename}`:**\n```{content}```")
-        except Exception as e:
-            await ctx.send(f"Lỗi đọc file: {str(e)}")
-
-# Lệnh ngonmess
-@bot.command()
-async def ngonmess(ctx, id_box: str, cookie: str, filename: str, speed: float):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-
-    admin_id = str(ctx.author.id)
-    file_path = f"data/{admin_id}/{filename}"
-
-    if not os.path.exists(file_path):
-        return await ctx.send(f"File `{filename}` không tồn tại. Dùng `{PREFIX}listngonmess` để xem danh sách.")
-
-    cm = CookieManager(cookie, id_box)
-    if not cm.init_params():
-        return await ctx.send("Cookie không hợp lệ hoặc không lấy được thông tin.")
-
-    with open(file_path, 'r', encoding='utf-8') as f:
-        message_body = f.read().strip()
-
-    task_id = f"ngonmess_{id_box}_{time.time()}"
-    cookie_managers[task_id] = cm
-    
-    async def spam_loop_task():
-        while True:
-            success = send_message_with_manager(cm, message_body)
-            if success:
-                print(f"{COLOR_SUCCESS}[+] Đã gửi 1 tin nhắn vào box {id_box}{trang}")
-            else:
-                print(f"{COLOR_ERROR}[!] Gửi thất bại vào box {id_box}{trang}")
-            await asyncio.sleep(speed)
-
-    task = asyncio.create_task(spam_loop_task())
-    running_tasks[task_id] = task
-    task_info[task_id] = {'admin_id': ctx.author.id, 'start_time': time.time()}
-    await ctx.send(f"Đã bắt đầu spam vào box `{id_box}` với file `{filename}` tốc độ `{speed}` giây.")
-
-@bot.command()
-async def stopngonmess(ctx, idgroup: str):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    
-    tasks_to_stop = [task_id for task_id in running_tasks if task_id.startswith(f"ngonmess_{idgroup}")]
-    if not tasks_to_stop:
-        return await ctx.send(f"Không có task nào đang chạy cho nhóm `{idgroup}`.")
-    
-    for task_id in tasks_to_stop:
-        if task_info.get(task_id, {}).get('admin_id') == ctx.author.id or ctx.author.id == IDADMIN_GOC:
-            try:
-                running_tasks[task_id].cancel()
-            except:
-                pass
-            del running_tasks[task_id]
-            if task_id in cookie_managers:
-                del cookie_managers[task_id]
-            if task_id in task_info:
-                del task_info[task_id]
-            await ctx.send(f"Đã dừng task cho nhóm `{idgroup}`.")
-        else:
-            await ctx.send(f"Bạn không có quyền dừng task `{task_id}`.")
-
-# Lệnh nhay
-@bot.command()
-async def nhay(ctx, id_box: str, cookie: str, speed: float):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-
-    path = "nhay.txt"
-    if not os.path.exists(path):
-        return await ctx.send("Không tìm thấy file `nhay.txt` trong thư mục gốc.")
-
-    cm = CookieManager(cookie, id_box)
-    if not cm.init_params():
-        return await ctx.send("Cookie không hợp lệ hoặc không lấy được thông tin.")
-
-    with open(path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
-    
-    if not lines:
-        return await ctx.send("File `nhay.txt` rỗng.")
-
-    task_id = f"nhay_{id_box}_{time.time()}"
-    cookie_managers[task_id] = cm
-    
-    async def loop_nhay():
-        index = 0
-        while True:
-            send_message_with_manager(cm, lines[index])
-            index = (index + 1) % len(lines)
-            await asyncio.sleep(speed)
-
-    task = asyncio.create_task(loop_nhay())
-    running_tasks[task_id] = task
-    task_info[task_id] = {'admin_id': ctx.author.id, 'start_time': time.time()}
-    await ctx.send(f"Đã bắt đầu nhảy tin nhắn vào box `{id_box}` với tốc độ `{speed}` giây.")
-
-@bot.command()
-async def stopnhay(ctx, id_box: str):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    
-    tasks_to_stop = [task_id for task_id in running_tasks if task_id.startswith(f"nhay_{id_box}")]
-    if not tasks_to_stop:
-        return await ctx.send(f"Không có task nào đang chạy cho box `{id_box}`.")
-    
-    for task_id in tasks_to_stop:
-        if task_info.get(task_id, {}).get('admin_id') == ctx.author.id or ctx.author.id == IDADMIN_GOC:
-            try:
-                running_tasks[task_id].cancel()
-            except:
-                pass
-            del running_tasks[task_id]
-            if task_id in cookie_managers:
-                del cookie_managers[task_id]
-            if task_id in task_info:
-                del task_info[task_id]
-            await ctx.send(f"Đã dừng task nhay cho box `{id_box}`.")
-        else:
-            await ctx.send(f"Bạn không có quyền dừng task `{task_id}`.")
-
-# Lệnh reo
-@bot.command()
-async def reo(ctx, id_box: str, cookie: str, delay: float):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    
-    file_path = "nhay.txt"
-    if not os.path.exists(file_path):
-        return await ctx.send("File `nhay.txt` không tồn tại.")
-
-    await ctx.send("Vui lòng nhập ID người cần tag:")
+async def setfile(ctx):
+    global default_full_text, default_lines, default_poll_question, default_poll_options
+    if ctx.author.id != ADMIN_ID: return
 
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
-    try:
-        msg = await bot.wait_for('message', timeout=30.0, check=check)
-        tagged_id = msg.content.strip()
-        if not tagged_id.isdigit():
-            return await ctx.send("ID tag phải là số hợp lệ.")
-    except asyncio.TimeoutError:
-        return await ctx.send("Hết thời gian chờ nhập ID tag.")
+    await ctx.send("📤 Hãy **upload file .txt** hoặc **nhập đường dẫn file** (gửi 'cancel' để hủy):")
+    msg = await bot.wait_for("message", check=check)
+    if msg.content.lower() == "cancel":
+        await ctx.send("Đã hủy.")
+        return
 
-    cm = CookieManager(cookie, id_box)
-    if not cm.init_params():
-        return await ctx.send("Cookie không hợp lệ hoặc không lấy được thông tin.")
+    content = None
+    if msg.attachments:
+        att = msg.attachments[0]
+        if not att.filename.endswith('.txt'):
+            await ctx.send("❌ Chỉ chấp nhận file .txt")
+            return
+        content = (await att.read()).decode('utf-8')
+    else:
+        file_path = msg.content.strip()
+        if not os.path.isfile(file_path):
+            await ctx.send(f"❌ Không tìm thấy file: {file_path}")
+            return
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
     if not lines:
-        return await ctx.send("File `nhay.txt` rỗng.")
+        await ctx.send("❌ File rỗng")
+        return
 
-    task_id = f"reo_{id_box}_{time.time()}"
-    cookie_managers[task_id] = cm
-    
-    async def spam_reo():
-        index = 0
-        while True:
-            content = f"{lines[index]} @[{tagged_id}:0]"
-            send_message_with_manager(cm, content)
-            index = (index + 1) % len(lines)
-            await asyncio.sleep(delay)
-
-    task = asyncio.create_task(spam_reo())
-    running_tasks[task_id] = task
-    task_info[task_id] = {'admin_id': ctx.author.id, 'start_time': time.time(), 'tagged_id': tagged_id}
-    await ctx.send(f"Đã bắt đầu reo vào box `{id_box}` tag ID `{tagged_id}` tốc độ `{delay}` giây.")
+    default_full_text = content.strip()
+    default_lines = lines
+    if len(lines) >= 3:
+        default_poll_question = lines[0]
+        default_poll_options = lines[1:3]
+        await ctx.send(f"✅ Đã set file với {len(lines)} dòng.\n📌 ngonmess: gửi toàn bộ file.\n📌 treopoll: dùng 3 dòng đầu (câu hỏi: `{default_poll_question[:50]}...`)\n📌 nhaytag: dùng từng dòng.")
+    else:
+        default_poll_question = ""
+        default_poll_options = []
+        await ctx.send(f"✅ Đã set file với {len(lines)} dòng.\n⚠️ treopoll cần ít nhất 3 dòng, hiện tại không đủ.")
 
 @bot.command()
-async def stopreo(ctx, id_box: str):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-    
-    tasks_to_stop = [task_id for task_id in running_tasks if task_id.startswith(f"reo_{id_box}")]
-    if not tasks_to_stop:
-        return await ctx.send(f"Không có task reo nào đang chạy cho box `{id_box}`.")
-    
-    for task_id in tasks_to_stop:
-        if task_info.get(task_id, {}).get('admin_id') == ctx.author.id or ctx.author.id == IDADMIN_GOC:
-            try:
-                running_tasks[task_id].cancel()
-            except:
-                pass
-            del running_tasks[task_id]
-            if task_id in cookie_managers:
-                del cookie_managers[task_id]
-            if task_id in task_info:
-                del task_info[task_id]
-            await ctx.send(f"Đã dừng reo cho box `{id_box}`.")
+async def idbox(ctx, cookie: str = None):
+    if ctx.author.id != ADMIN_ID or not cookie:
+        await ctx.send("Cú pháp: `.idbox <cookie>`")
+        return
+    proxy_dict = {"http": get_next_proxy(), "https": get_next_proxy()} if proxy_list else None
+    await ctx.send("🔄 Đang lấy danh sách box...")
+    result = get_thread_list(cookie, proxy_dict)
+    if isinstance(result, dict) and "error" in result:
+        await ctx.send(f"❌ {result['error']}")
+        return
+    if not result:
+        await ctx.send("❌ Không tìm thấy box nào")
+        return
+    msg = "**📋 Danh sách box:**\n```\n"
+    for i, t in enumerate(result, 1):
+        msg += f"{i}. {t['thread_name'][:40]} - {t['thread_id']}\n"
+    msg += "```"
+    await ctx.send(msg[:2000])
+
+@bot.command()
+async def ngonmess(ctx, idbox: str = None, cookie: str = None, delay: str = None):
+    if ctx.author.id != ADMIN_ID or None in (idbox, cookie, delay):
+        await ctx.send("Cú pháp: `.ngonmess <idbox> <cookie> <delay>`")
+        return
+    if not default_full_text:
+        await ctx.send("❌ Chưa có file mặc định. Hãy dùng `.setfile` trước.")
+        return
+    try:
+        delay = float(delay)
+    except:
+        await ctx.send("Delay phải là số")
+        return
+    stop = threading.Event()
+    threading.Thread(target=ngonmess_loop, args=(cookie, idbox, delay, stop), daemon=True).start()
+    active_tabs.setdefault(ctx.author.id, []).append({"type": "ngonmess", "idbox": idbox, "stop": stop, "start": time.time()})
+    await ctx.send(f"✅ Bắt đầu ngonmess tới {idbox}, delay {delay}s (gửi toàn bộ file)")
+
+@bot.command()
+async def treopoll(ctx, idbox: str = None, cookie: str = None, delay: str = None):
+    if ctx.author.id != ADMIN_ID or None in (idbox, cookie, delay):
+        await ctx.send("Cú pháp: `.treopoll <idbox> <cookie> <delay>`")
+        return
+    if not default_poll_question or len(default_poll_options) < 2:
+        await ctx.send("❌ File mặc định cần ít nhất 3 dòng để tạo poll. Hãy dùng `.setfile` với file có >=3 dòng.")
+        return
+    try:
+        delay = float(delay)
+    except:
+        await ctx.send("Delay phải là số")
+        return
+    stop = threading.Event()
+    threading.Thread(target=treopoll_loop, args=(cookie, idbox, delay, stop), daemon=True).start()
+    active_tabs.setdefault(ctx.author.id, []).append({"type": "treopoll", "idbox": idbox, "stop": stop, "start": time.time()})
+    await ctx.send(f"✅ Bắt đầu treopoll tới {idbox}, delay {delay}s (dùng 3 dòng đầu)")
+
+@bot.command()
+async def nhaytag(ctx, idbox: str = None, cookie: str = None, uid_list: str = None, delay: str = None):
+    if ctx.author.id != ADMIN_ID or None in (idbox, cookie, uid_list, delay):
+        await ctx.send("Cú pháp: `.nhaytag <idbox> <cookie> <uid1,uid2,...> <delay>`")
+        return
+    if not default_lines:
+        await ctx.send("❌ Chưa có file mặc định. Hãy dùng `.setfile` trước.")
+        return
+    uids = [u.strip() for u in uid_list.split(',') if u.strip()]
+    if not uids:
+        await ctx.send("❌ Phải có ít nhất 1 uid")
+        return
+    try:
+        delay = float(delay)
+    except:
+        await ctx.send("Delay phải là số")
+        return
+    stop = threading.Event()
+    threading.Thread(target=nhaytag_loop, args=(cookie, idbox, uids, delay, stop), daemon=True).start()
+    active_tabs.setdefault(ctx.author.id, []).append({"type": "nhaytag", "idbox": idbox, "stop": stop, "start": time.time()})
+    await ctx.send(f"✅ Bắt đầu nhaytag tới {idbox} với {len(uids)} uid, delay {delay}s")
+
+@bot.command()
+async def nhay(ctx, idbox: str = None, cookie: str = None, delay: str = None):
+    if ctx.author.id != ADMIN_ID:
+        return
+    if None in (idbox, cookie, delay):
+        await ctx.send("Cú pháp: `.nhay <idbox> <cookie> <delay>`")
+        return
+    try:
+        delay = float(delay)
+    except:
+        await ctx.send("Delay phải là số")
+        return
+    if not os.path.isfile("nhay.txt"):
+        await ctx.send("❌ Không tìm thấy file `nhay.txt` trong thư mục bot!")
+        return
+    with open("nhay.txt", 'r', encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+    if not lines:
+        await ctx.send("❌ File `nhay.txt` rỗng!")
+        return
+    stop = threading.Event()
+    threading.Thread(target=nhay_loop, args=(cookie, idbox, delay, stop), daemon=True).start()
+    active_tabs.setdefault(ctx.author.id, []).append({"type": "nhay", "idbox": idbox, "stop": stop, "start": time.time()})
+    await ctx.send(f"✅ Bắt đầu nhay tới {idbox}, delay {delay}s (nội dung từ nhay.txt, có typing)")
+
+@bot.command()
+async def setnen(ctx, idbox: str = None, cookie: str = None, delay: str = None):
+    if ctx.author.id != ADMIN_ID or None in (idbox, cookie, delay):
+        await ctx.send("Cú pháp: `.setnen <idbox> <cookie> <delay>`")
+        return
+    try:
+        delay = float(delay)
+    except:
+        await ctx.send("Delay phải là số")
+        return
+    stop = threading.Event()
+    threading.Thread(target=setnen_loop, args=(cookie, idbox, delay, stop), daemon=True).start()
+    active_tabs.setdefault(ctx.author.id, []).append({"type": "setnen", "idbox": idbox, "stop": stop, "start": time.time()})
+    await ctx.send(f"✅ Bắt đầu set theme random cho {idbox}, delay {delay}s")
+
+@bot.command()
+async def uptime(ctx):
+    if ctx.author.id != ADMIN_ID: return
+    await ctx.send(f"⏰ Bot đã chạy: `{runtime(BOT_START_TIME)}`")
+
+@bot.command()
+async def tab(ctx):
+    if ctx.author.id != ADMIN_ID: return
+    tabs = active_tabs.get(ctx.author.id, [])
+    if not tabs:
+        await ctx.send("Không có task nào đang chạy")
+        return
+    out = ["**📋 Danh sách task đang chạy:**"]
+    for i, t in enumerate(tabs, 1):
+        out.append(f"{i}. **{t['type']}** - {t['idbox']} - {runtime(t['start'])}")
+    await ctx.send("\n".join(out))
+
+@bot.command()
+async def stop(ctx, index_str: str = None):
+    if ctx.author.id != ADMIN_ID:
+        return
+    user_tabs = active_tabs.get(ctx.author.id, [])
+    if not user_tabs:
+        await ctx.send("Không có task nào đang chạy.")
+        return
+
+    if index_str is None:
+        await ctx.send("❌ Cú pháp: `.stop <số thứ tự>` hoặc `.stop all`\nDùng `.tab` để xem số thứ tự.")
+        return
+
+    if index_str.lower() == 'all':
+        for tab in list(user_tabs):
+            tab["stop"].set()
+        active_tabs[ctx.author.id] = []
+        await ctx.send(f"✅ Đã dừng tất cả {len(user_tabs)} task.")
+        return
+
+    try:
+        idx = int(index_str) - 1
+        if 0 <= idx < len(user_tabs):
+            tab = user_tabs[idx]
+            tab["stop"].set()
+            active_tabs[ctx.author.id].pop(idx)
+            await ctx.send(f"✅ Đã dừng task #{idx+1} ({tab['type']} - {tab['idbox']})")
         else:
-            await ctx.send(f"Bạn không có quyền dừng task `{task_id}`.")
+            await ctx.send(f"❌ Số thứ tự không hợp lệ (1..{len(user_tabs)})")
+    except ValueError:
+        await ctx.send("❌ Vui lòng nhập số thứ tự hoặc 'all'")
 
-# Icon cho codelag
-icon_code = "⃟꙰⃟꙰⃟꙰꙰⃟꙰⃟꙰⃟꙰꙰"
-
-@bot.command()
-async def codelag(ctx, id_box: str, cookie: str, speed: float):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-
-    path = "nhay.txt"
-    if not os.path.exists(path):
-        return await ctx.send("Không tìm thấy file `nhay.txt`.")
-
-    cm = CookieManager(cookie, id_box)
-    if not cm.init_params():
-        return await ctx.send("Cookie không hợp lệ hoặc không lấy được thông tin.")
-
-    with open(path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    task_id = f"codelag_{id_box}_{time.time()}"
-    cookie_managers[task_id] = cm
-
-    async def loop_codelag():
-        index = 0
-        while True:
-            message = f"{lines[index]} {icon_code}"
-            send_message_with_manager(cm, message)
-            index = (index + 1) % len(lines)
-            await asyncio.sleep(speed)
-
-    task = asyncio.create_task(loop_codelag())
-    running_tasks[task_id] = task
-    task_info[task_id] = {'admin_id': ctx.author.id, 'start_time': time.time()}
-    await ctx.send(f"Đã bắt đầu codelag vào box `{id_box}` với tốc độ `{speed}` giây.")
-
-@bot.command()
-async def stopcodelag(ctx, id_box: str):
-    if ctx.author.id not in admins:
-        return await ctx.send("Bạn không có quyền sử dụng lệnh này.")
-
-    tasks_to_stop = [task_id for task_id in running_tasks if task_id.startswith(f"codelag_{id_box}")]
-    if not tasks_to_stop:
-        return await ctx.send(f"Không có task codelag nào đang chạy cho box `{id_box}`.")
-
-    for task_id in tasks_to_stop:
-        if task_info.get(task_id, {}).get('admin_id') == ctx.author.id or ctx.author.id == IDADMIN_GOC:
-            try:
-                running_tasks[task_id].cancel()
-            except:
-                pass
-            del running_tasks[task_id]
-            if task_id in cookie_managers:
-                del cookie_managers[task_id]
-            if task_id in task_info:
-                del task_info[task_id]
-            await ctx.send(f"Đã dừng codelag cho box `{id_box}`.")
-        else:
-            await ctx.send(f"Bạn không có quyền dừng task `{task_id}`.")
-
-# Các lệnh tab
-@bot.command()
-async def tabngonmess(ctx):
-    admin_task_count = {}
-    for task_id, info in task_info.items():
-        if task_id.startswith("ngonmess_"):
-            admin_id = info.get('admin_id')
-            if admin_id:
-                admin_task_count[admin_id] = admin_task_count.get(admin_id, 0) + 1
-
-    if not admin_task_count:
-        return await ctx.send("Hiện không có task ngonmess nào chạy.")
-
-    admin_list = list(admin_task_count.items())
-    msg = "**Danh sách admin đang có task:**\n"
-    for i, (admin_id, count) in enumerate(admin_list, start=1):
-        try:
-            user = await bot.fetch_user(admin_id)
-            msg += f"{i}. Admin {user.mention} đã tạo {count} task.\n"
-        except:
-            msg += f"{i}. Admin ID {admin_id} đã tạo {count} task.\n"
-    await ctx.send(msg)
-
-@bot.command()
-async def tabnhay(ctx):
-    admin_task_count = {}
-    for task_id, info in task_info.items():
-        if task_id.startswith("nhay_"):
-            admin_id = info.get('admin_id')
-            if admin_id:
-                admin_task_count[admin_id] = admin_task_count.get(admin_id, 0) + 1
-
-    if not admin_task_count:
-        return await ctx.send("Hiện không có task nhay nào chạy.")
-
-    admin_list = list(admin_task_count.items())
-    msg = "**Danh sách admin đang có task:**\n"
-    for i, (admin_id, count) in enumerate(admin_list, start=1):
-        try:
-            user = await bot.fetch_user(admin_id)
-            msg += f"{i}. Admin {user.mention} đã tạo {count} task.\n"
-        except:
-            msg += f"{i}. Admin ID {admin_id} đã tạo {count} task.\n"
-    await ctx.send(msg)
-
-@bot.command()
-async def tabcodelag(ctx):
-    admin_task_count = {}
-    for task_id, info in task_info.items():
-        if task_id.startswith("codelag_"):
-            admin_id = info.get('admin_id')
-            if admin_id:
-                admin_task_count[admin_id] = admin_task_count.get(admin_id, 0) + 1
-
-    if not admin_task_count:
-        return await ctx.send("Hiện không có task codelag nào chạy.")
-
-    admin_list = list(admin_task_count.items())
-    msg = "**Danh sách admin đang có task:**\n"
-    for i, (admin_id, count) in enumerate(admin_list, start=1):
-        try:
-            user = await bot.fetch_user(admin_id)
-            msg += f"{i}. Admin {user.mention} đã tạo {count} task.\n"
-        except:
-            msg += f"{i}. Admin ID {admin_id} đã tạo {count} task.\n"
-    await ctx.send(msg)
-
-# Menu
-@bot.command()
-async def menu(ctx):
-    embed = discord.Embed(
-        title="『 **Menu Bot Facebook** 』",
-        description=f"""
-Admin: Real Love And Forever Time
-Prefix: `{PREFIX}`
-
-**Admin & Quản lý**
-🔷 `{PREFIX}addadmin @tag` – Thêm admin
-🔷 `{PREFIX}deladmin @tag` – Xoá admin
-🔷 `{PREFIX}listadmin` – DS admin
-
-**Quản lý file**
-🔷 `{PREFIX}setngonmess [file]` – Lưu file
-🔷 `{PREFIX}listngonmess` – DS file đã lưu
-🔷 `{PREFIX}xemngonmess <tên_file>` – Xem nội dung file
-
-**Treo Messenger**
-🔷 `{PREFIX}ngonmess <id> <cookie> <file> <delay>` – Spam
-🔷 `{PREFIX}stopngonmess <id>` – Dừng
-🔷 `{PREFIX}tabngonmess` – DS task
-
-**Ré/Nhảy Messenger**
-🔷 `{PREFIX}reo <id> <cookie> <delay>` – Réo tag
-🔷 `{PREFIX}stopreo <id>` – Dừng réo
-🔷 `{PREFIX}nhay <id> <cookie> <delay>` – Nhảy tin
-🔷 `{PREFIX}stopnhay <id>` – Dừng nhảy
-🔷 `{PREFIX}tabnhay` – DS task nhay
-
-**Codelag Messenger**
-🔷 `{PREFIX}codelag <id> <cookie> <delay>` – Code lag
-🔷 `{PREFIX}stopcodelag <id>` – Dừng
-🔷 `{PREFIX}tabcodelag` – DS task
-
-**Thông tin**
-🔷 Admin Gốc: <@{IDADMIN_GOC}>
-""",
-        color=discord.Color.blue()
-    )
-    await ctx.send(embed=embed)
-
-# ========== PHẦN CHẠY BOT ĐÃ FIX CHO PYTHON 3.13 ==========
-async def main():
-    """Khởi động bot đúng cách cho Python 3.13"""
-    async with bot:
-        # Tạo task dọn RAM chạy ngầm
-        asyncio.create_task(ram_cleaner_loop())
-        # Khởi động bot
-        await bot.start(TOKEN)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+bot.run(BOT_TOKEN
